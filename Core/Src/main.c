@@ -47,6 +47,8 @@ TaskHandle_t AdcTaskHandle;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 RTC_HandleTypeDef hrtc;
 
 UART_HandleTypeDef huart2;
@@ -58,7 +60,26 @@ const osThreadAttr_t TimeBasedTask_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for TransmitTask */
+osThreadId_t TransmitTaskHandle;
+const osThreadAttr_t TransmitTask_attributes = {
+  .name = "TransmitTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
+
+typedef struct
+{
+    uint16_t moist_1;
+    uint16_t moist_2;
+    uint16_t moist_3;
+    uint16_t moist_4;
+    uint16_t temp_1;
+    uint16_t temp_3;
+} SensorRaw_t;
+
+static SensorRaw_t g_sensor_raw;
 
 /* USER CODE END PV */
 
@@ -67,7 +88,9 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_RTC_Init(void);
+static void MX_ADC1_Init(void);
 void StartTimeBasedTask(void *argument);
+void StartTransmitTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -75,6 +98,84 @@ void StartTimeBasedTask(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static HAL_StatusTypeDef ReadAllAdcChannels(SensorRaw_t *out)
+{
+    uint32_t values[6] = {0};
+
+    if (out == NULL)
+        return HAL_ERROR;
+
+    if (HAL_ADC_Start(&hadc1) != HAL_OK)
+        return HAL_ERROR;
+
+    for (int i = 0; i < 6; i++)
+    {
+        if (HAL_ADC_PollForConversion(&hadc1, 20) != HAL_OK)
+        {
+            HAL_ADC_Stop(&hadc1);
+            return HAL_TIMEOUT;
+        }
+
+        values[i] = HAL_ADC_GetValue(&hadc1);
+    }
+
+    if (HAL_ADC_Stop(&hadc1) != HAL_OK)
+        return HAL_ERROR;
+
+    out->moist_1 = (uint16_t)values[0];
+    out->moist_2 = (uint16_t)values[1];
+    out->moist_3 = (uint16_t)values[2];
+    out->moist_4 = (uint16_t)values[3];
+    out->temp_1  = (uint16_t)values[4];
+    out->temp_3  = (uint16_t)values[5];
+
+    return HAL_OK;
+}
+
+static float AdcToVoltage(uint16_t raw)
+{
+    const float vdda = 3.3f;
+    return ((float)raw * vdda) / 4095.0f;
+}
+
+static void SendSensorLine(const SensorRaw_t *s)
+{
+    if (s == NULL)
+        return;
+
+    char txbuf[160];
+
+    float v_m1 = AdcToVoltage(s->moist_1);
+    float v_m2 = AdcToVoltage(s->moist_2);
+    float v_m3 = AdcToVoltage(s->moist_3);
+    float v_m4 = AdcToVoltage(s->moist_4);
+    float v_t1 = AdcToVoltage(s->temp_1);
+    float v_t3 = AdcToVoltage(s->temp_3);
+
+    int len = snprintf(
+        txbuf, sizeof(txbuf),
+        "moist_1=%u(%.3fV), moist_2=%u(%.3fV), moist_3=%u(%.3fV), moist_4=%u(%.3fV), TEMP_1=%u(%.3fV), TEMP_3=%u(%.3fV)\r\n",
+        s->moist_1, v_m1,
+        s->moist_2, v_m2,
+        s->moist_3, v_m3,
+        s->moist_4, v_m4,
+        s->temp_1,  v_t1,
+        s->temp_3,  v_t3
+    );
+
+    if (len <= 0)
+        return;
+
+    if (len >= (int)sizeof(txbuf))
+    {
+        // Message truncated; skip it to avoid sending partial junk
+        return;
+    }
+
+    // Short timeout so the task does not get stuck
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)txbuf, (uint16_t)len, 50);
+}
 /* USER CODE END 0 */
 
 /**
@@ -108,6 +209,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_RTC_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   /* USER CODE END 2 */
 
@@ -133,6 +235,9 @@ int main(void)
   /* Create the thread(s) */
   /* creation of TimeBasedTask */
   TimeBasedTaskHandle = osThreadNew(StartTimeBasedTask, NULL, &TimeBasedTask_attributes);
+
+  /* creation of TransmitTask */
+  TransmitTaskHandle = osThreadNew(StartTransmitTask, NULL, &TransmitTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -214,6 +319,118 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 6;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_92CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = ADC_REGULAR_RANK_4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = ADC_REGULAR_RANK_6;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
   * @brief RTC Initialization Function
   * @param None
   * @retval None
@@ -254,8 +471,8 @@ static void MX_RTC_Init(void)
 
   /** Initialize RTC and set the Time and Date
   */
-  sTime.Hours = 21;
-  sTime.Minutes = 12;
+  sTime.Hours = 17;
+  sTime.Minutes = 40;
   sTime.Seconds = 0;
   sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
   sTime.StoreOperation = RTC_STOREOPERATION_RESET;
@@ -355,18 +572,6 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, PumpB_Pin|PumpA_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : MOIST_1_Pin MOIST_2_Pin MOIST_3_Pin MOIST_4_Pin */
-  GPIO_InitStruct.Pin = MOIST_1_Pin|MOIST_2_Pin|MOIST_3_Pin|MOIST_4_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : TEMP_1_Pin TEMP_3_Pin */
-  GPIO_InitStruct.Pin = TEMP_1_Pin|TEMP_3_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG_ADC_CONTROL;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   /*Configure GPIO pin : LampsRelay_Pin */
   GPIO_InitStruct.Pin = LampsRelay_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -387,12 +592,7 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-int _write(int file, char *ptr, int len) {
-    if (HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, 100) == HAL_OK) {
-        return len;
-    }
-    return 0;
-}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartTimeBasedTask */
@@ -462,6 +662,41 @@ void StartTimeBasedTask(void *argument)
 	  osDelay(1000); // Check every 1 second
 	}
   /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartTransmitTask */
+/**
+* @brief Function implementing the TransmitTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTransmitTask */
+void StartTransmitTask(void *argument)
+{
+  /* USER CODE BEGIN StartTransmitTask */
+  /* Infinite loop */
+
+	{
+		TickType_t lastWakeTime = xTaskGetTickCount();
+		const TickType_t period = pdMS_TO_TICKS(10000); // 10 seconds
+
+		for (;;)
+		{
+			if (ReadAllAdcChannels(&g_sensor_raw) == HAL_OK)
+			{
+				SendSensorLine(&g_sensor_raw);
+			}
+			else
+			{
+				const char err[] = "ADC read error\r\n";
+				(void)HAL_UART_Transmit(&huart2, (uint8_t*)err, sizeof(err) - 1, 20);
+			}
+
+			vTaskDelayUntil(&lastWakeTime, period);
+		}
+	}
+
+  /* USER CODE END StartTransmitTask */
 }
 
 /**
